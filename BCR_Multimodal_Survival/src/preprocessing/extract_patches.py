@@ -3,10 +3,22 @@ import os
 import multiprocessing
 from wsitools.tissue_detection.tissue_detector import TissueDetector
 from wsitools.patch_extraction.patch_extractor import ExtractorParameters, PatchExtractor
-
+import argparse
 # ------------------- Configuration -------------------
 
-num_processors = 4
+parser = argparse.ArgumentParser()
+
+parser.add_argument(
+    "--num_processors",
+    type=int,
+    default=4,
+    help="Number of CPU workers for patch extraction",
+)
+
+args = parser.parse_args()
+
+num_processors = args.num_processors
+
 wsi_dir = "./data/raw/wsi"
 output_dir = "./data/interim/wsi/patches"
 

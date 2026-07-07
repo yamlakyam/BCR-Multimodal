@@ -1,5 +1,4 @@
-torch
-torchvision
+
 timm==0.9.8
 torchstain==1.4.1
 
