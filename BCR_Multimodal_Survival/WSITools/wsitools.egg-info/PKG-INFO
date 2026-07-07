@@ -1,0 +1,28 @@
+Metadata-Version: 2.4
+Name: wsitools
+Version: 0.1.5
+Summary: Whole slide image processing tools
+Home-page: https://github.com/smujiang/smujiang.github.io
+Author: Jun Jiang
+Author-email: Jiang.Jun@mayo.edu
+License: Creative Commons Attribution-Noncommercial-Share Alike license
+License-File: LICENSE
+Requires-Dist: numpy
+Requires-Dist: matplotlib
+Requires-Dist: opencv-python
+Requires-Dist: xlrd
+Requires-Dist: scikit-image
+Requires-Dist: scikit-learn
+Requires-Dist: scipy
+Requires-Dist: openslide-python
+Requires-Dist: shapely
+Requires-Dist: pillow
+Requires-Dist: joblib
+Requires-Dist: tensorflow
+Dynamic: author
+Dynamic: author-email
+Dynamic: home-page
+Dynamic: license
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: summary

@@ -1,0 +1,6 @@
+scripts/*
+*.pyc
+*.swp
+checkpoints/*
+pretrained_weights/*
+datasets/*

@@ -1,0 +1,12 @@
+numpy
+matplotlib
+opencv-python
+xlrd
+scikit-image
+scikit-learn
+scipy
+openslide-python
+shapely
+pillow
+joblib
+tensorflow
