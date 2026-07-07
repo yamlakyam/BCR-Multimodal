@@ -1,28 +1,63 @@
-import numpy as np
-import os
-from skimage.color import rgb2lab
+#!/usr/bin/env python3
+"""
+TensorFlow-optional patch extractor for WSITools.
+
+This version keeps the original WSITools behavior for:
+- tissue detection
+- patch extraction to .png / .jpg / .h5
+
+and only requires TensorFlow if you choose save_format=".tfrecord".
+"""
+
 import logging
-import tensorflow as tf
+import os
 import sys
+import concurrent.futures
+
 import h5py
-import concurrent  # python 2.7 don't support this module
+import numpy as np
 from PIL import Image, ImageDraw
 from scipy import ndimage
+from skimage.color import rgb2lab
+
+# Optional imports
+try:
+    import tensorflow as tf
+except Exception:
+    tf = None
+
+try:
+    import cupy  # type: ignore
+except Exception:
+    cupy = None
+
+try:
+    import cucim  # type: ignore
+except Exception:
+    cucim = None
+
+try:
+    import openslide  # type: ignore
+except Exception:
+    openslide = None
+
 
 logger = logging.getLogger(__name__)
-ch = logging.StreamHandler()
-formatter = logging.Formatter('\x1b[80D\x1b[1A\x1b[K%(message)s')
-ch.setFormatter(formatter)
-logger.addHandler(ch)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    formatter = logging.Formatter("\x1b[80D\x1b[1A\x1b[K%(message)s")
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
-device_list = tf.config.list_physical_devices('GPU')
-is_cuda_gpu_available = tf.test.is_gpu_available(cuda_only=True)
+# WSITools originally tried to detect CUDA via TensorFlow.
+# For your current pipeline (.png / .h5), keep this off by default.
+device_list = []
 is_cuda_gpu_available = False
-if is_cuda_gpu_available:
-    import cupy
-    import cucim  # if GPU and cuda available
-else:
-    import openslide  # if GPU or cuda not available
+
+# Used by parallel_save_patches
+patch_cnt = 0
 
 
 class ExtractorParameters:
@@ -30,149 +65,167 @@ class ExtractorParameters:
     Class for establishing & validating parameters for patch extraction
     """
 
-    def __init__(self, save_dir=None, log_dir="./", save_format=".tfrecord", sample_cnt=-1, patch_filter_by_area=None, \
-                 with_anno=True, threads=20, rescale_rate=128, patch_size=128, stride=128, patch_rescale_to=None,
-                 extract_layer=0, randomize_order=False):
-        if save_dir is None:  # specify a directory to save the extracted patches
+    def __init__(
+        self,
+        save_dir=None,
+        log_dir="./",
+        save_format=".tfrecord",
+        sample_cnt=-1,
+        patch_filter_by_area=None,
+        with_anno=True,
+        threads=20,
+        rescale_rate=128,
+        patch_size=128,
+        stride=128,
+        patch_rescale_to=None,
+        extract_layer=0,
+        randomize_order=False,
+    ):
+        if save_dir is None:
             raise Exception("Must specify a directory to save the extraction")
-        self.save_dir = save_dir  # Output dir
-        self.log_dir = log_dir  # Output dir
-        self.save_format = save_format  # Save to .tfrecord or .jpg
-        self.with_anno = with_anno  # If true, you need to supply an additional XML file
-        self.rescale_rate = rescale_rate  # Fold size to scale the thumbnail to (for faster processing)
-        self.patch_size = patch_size  # Size of patches to extract (Height & Width)
-        self.stride = stride  # stride for patch extraction
-        self.patch_rescale_to = patch_rescale_to  # rescale the extracted patches
-        self.extract_layer = extract_layer  # OpenSlide Level
-        self.patch_filter_by_area = patch_filter_by_area  # Amount of tissue that should be present in a patch
-        self.sample_cnt = sample_cnt  # Limit the number of patches to extract (-1 == all patches)
-        self.randomize_order = randomize_order # Randomize patch order; combine with sample_cnt to get a random sample
+
+        self.save_dir = save_dir
+        self.log_dir = log_dir
+        self.save_format = save_format
+        self.with_anno = with_anno
+        self.rescale_rate = rescale_rate
+        self.patch_size = patch_size
+        self.stride = stride
+        self.patch_rescale_to = patch_rescale_to
+        self.extract_layer = extract_layer
+        self.patch_filter_by_area = patch_filter_by_area
+        self.sample_cnt = sample_cnt
+        self.randomize_order = randomize_order
         self.threads = threads
+
+        os.makedirs(self.save_dir, exist_ok=True)
+        if self.log_dir is not None:
+            os.makedirs(self.log_dir, exist_ok=True)
 
 
 class PatchExtractor:
     """
-    Class that sets up the remaining info for patch extraction, and contains the function to extract them
+    Class that sets up the remaining info for patch extraction,
+    and contains the function to extract them
     """
 
-    def __init__(self, detector=None, parameters=None,
-                 feature_map=None,  # See note below
-                 annotations=None  # Object of Annotation Class (see other note below)
-                 ):
+    def __init__(self, detector=None, parameters=None, feature_map=None, annotations=None):
+        if parameters is None:
+            raise ValueError("parameters must be provided")
+
         self.tissue_detector = detector
         self.threads = parameters.threads
         self.save_dir = parameters.save_dir
         self.log_dir = parameters.log_dir
-        self.rescale_rate = parameters.rescale_rate  # Fold size to scale the thumbnail to (for faster processing)
-        self.patch_size = parameters.patch_size  # Size of patches to extract (Height & Width)
-        self.stride = parameters.stride  # stride for patch extraction
-        self.patch_rescale_to = parameters.patch_rescale_to  # rescale the extracted patches
-        self.extract_layer = parameters.extract_layer  # OpenSlide Level
-        self.save_format = parameters.save_format  # Save to .tfrecord or .jpg
-        self.patch_filter_by_area = parameters.patch_filter_by_area  # Amount of tissue that should be present in a patch
-        self.sample_cnt = parameters.sample_cnt  # Limit the number of patches to extract (-1 == all patches)
-        self.randomize_order = parameters.randomize_order # Randomize patch order; use with sample_cnt for random sample
-        self.feature_map = feature_map  # Instructions for building tfRecords
-        self.annotations = annotations  # Annotation object
+        self.rescale_rate = parameters.rescale_rate
+        self.patch_size = parameters.patch_size
+        self.stride = parameters.stride
+        self.patch_rescale_to = parameters.patch_rescale_to
+        self.extract_layer = parameters.extract_layer
+        self.save_format = parameters.save_format
+        self.patch_filter_by_area = parameters.patch_filter_by_area
+        self.sample_cnt = parameters.sample_cnt
+        self.randomize_order = parameters.randomize_order
+        self.feature_map = feature_map
+        self.annotations = annotations
+
         if self.save_format == ".tfrecord":
+            if tf is None:
+                raise ImportError(
+                    "TensorFlow is required only for .tfrecord output. "
+                    "Use .png, .jpg, or .h5 to avoid this dependency."
+                )
             if feature_map is not None:
                 self.with_feature_map = True
-            else:  # feature map for tfRecords, if save_format is ".tfrecord", it can't be None
+            else:
                 raise Exception("A Feature map must be specified when you create tfRecords")
         else:
             if feature_map is not None:
                 logger.info("No need to specify feature_map ... ignoring.")
             self.with_feature_map = False
-        if annotations is None:
-            self.with_anno = False
-        else:
-            self.with_anno = True  # extract with annotation or not
+
+        self.with_anno = annotations is not None
+
+        os.makedirs(self.save_dir, exist_ok=True)
+        if self.log_dir is not None:
+            os.makedirs(self.log_dir, exist_ok=True)
 
     @staticmethod
     def get_case_info(wsi_fn):
         """
-        Converts the WSI filename into an OpenSlideObject and returns it and a dictionary of sample details
-        :param wsi_fn: Name of WSI file
-        :return: OpenSlideObject, case_description.dict
+        Converts the WSI filename into a slide object and returns it plus metadata
         """
-
-        if not is_cuda_gpu_available:
-            wsi_obj = openslide.open_slide(wsi_fn)
-        else:
+        if is_cuda_gpu_available and cucim is not None:
             wsi_obj = cucim.CuImage(wsi_fn)
+        else:
+            if openslide is None:
+                raise ImportError(
+                    "openslide is not available. Install openslide-python and openslide-bin."
+                )
+            wsi_obj = openslide.open_slide(wsi_fn)
+
         root_dir, fn = os.path.split(wsi_fn)
         uuid, ext = os.path.splitext(fn)
-        case_info = {"fn_str": uuid, "ext": ext, "root_dir": root_dir}  # TODO: get file information from the file name
+        case_info = {"fn_str": uuid, "ext": ext, "root_dir": root_dir}
         return wsi_obj, case_info
 
     def get_thumbnail(self, wsi_obj):
         """
-        Given an OpenSlideObject, return a down-sampled thumbnail image
-        :param wsi_obj: OpenSlideObject
-        :return: thumbnail_image
+        Given a slide object, return a down-sampled thumbnail image
         """
-        if not is_cuda_gpu_available:
-            wsi_w, wsi_h = wsi_obj.dimensions
-            thumb_size_x = wsi_w / self.rescale_rate
-            thumb_size_y = wsi_h / self.rescale_rate
-            thumbnail = wsi_obj.get_thumbnail([thumb_size_x, thumb_size_y]).convert("RGB")
-        else:
-            # whole_img = wsi_obj.read_region((0, 0), size=(wsi_obj.shape[1], wsi_obj.shape[0]), num_workers=6)
-            # whole_img_cupy_arr = cupy.asarray(whole_img, dtype='uint8')
-            # thumbnail_cupy = cucim.skimage.transform.rescale(whole_img_cupy_arr, (1/self.rescale_rate, 1/self.rescale_rate, 1), preserve_range=True).astype('uint8')
-            # thumbnail_cupy = cucim.skimage.transform.rescale(whole_img_cupy_arr, (1/128, 1/128, 1), preserve_range=True).astype('uint8')
-            # thumbnail = Image.fromarray(thumbnail_cupy.get())
-
-            # thumbnail = Image.fromarray(cucim.skimage.transform.rescale(
-            #     cupy.asarray(wsi_obj.read_region((0, 0), size=(wsi_obj.shape[1], wsi_obj.shape[0]), num_workers=6), dtype='uint8'),
-            #     (1 / self.rescale_rate, 1 / self.rescale_rate, 1),
-            #     preserve_range=True).astype('uint8').get())
-
+        if is_cuda_gpu_available and cupy is not None and cucim is not None:
             wsi_w, wsi_h = wsi_obj.shape[1], wsi_obj.shape[0]
-            thumb_size_x = wsi_w / self.rescale_rate
-            thumb_size_y = wsi_h / self.rescale_rate
-
-            wsi_numpy = cupy.asarray(wsi_obj.read_region((0, 0), size=(wsi_w, wsi_h), num_workers=6), dtype='uint8').get()
-            thumbnail = Image.fromarray(wsi_numpy[::self.rescale_rate, ::self.rescale_rate, :])
-
-            #thumbnail.save("./test.jpg")
-            # thumbnail = Image.fromarray(cucim.skimage.transform.resize(cupy.asarray(wsi_obj.read_region((0, 0), size=(wsi_w, wsi_h), num_workers=6), dtype='uint8'), [thumb_size_x, thumb_size_y, 3],
-            #                                preserve_range=True).get())
+            wsi_numpy = cupy.asarray(
+                wsi_obj.read_region((0, 0), size=(wsi_w, wsi_h), num_workers=6),
+                dtype="uint8",
+            ).get()
+            thumbnail = Image.fromarray(wsi_numpy[:: self.rescale_rate, :: self.rescale_rate, :])
+        else:
+            wsi_w, wsi_h = wsi_obj.dimensions
+            thumb_size_x = max(1, int(wsi_w / self.rescale_rate))
+            thumb_size_y = max(1, int(wsi_h / self.rescale_rate))
+            thumbnail = wsi_obj.get_thumbnail([thumb_size_x, thumb_size_y]).convert("RGB")
 
         return thumbnail
 
     def get_patch_locations(self, wsi_thumb_mask, level_downsamples):
         """
-        Given a binary mask representing the thumbnail image,  either return all the pixel positions that are positive,
-        or a limited number of pixels that are positive
-
-        :param wsi_thumb_mask: binary mask image with 1 for yes and 0 for no
-        :return: coordinate array where the positive pixels are
+        Return all positive patch coordinates from a thumbnail mask
         """
-
         wsi_thumb_mask = ndimage.binary_erosion(wsi_thumb_mask)
         pos_indices = np.where(wsi_thumb_mask > 0)
+
+        if len(pos_indices[0]) == 0:
+            return [[], []]
+
         loc_y = (np.array(pos_indices[0]) * self.rescale_rate).astype(np.int32)
         loc_x = (np.array(pos_indices[1]) * self.rescale_rate).astype(np.int32)
+
         loc_x_selected = []
         loc_y_selected = []
-        x_lim = [min(loc_x), max(loc_x)]
-        y_lim = [min(loc_y), max(loc_y)]
-        for x in range(x_lim[0], x_lim[1], int(self.stride * level_downsamples[self.extract_layer])):
-            for y in range(y_lim[0], y_lim[1], int(self.stride * level_downsamples[self.extract_layer])):
+
+        x_lim = [int(min(loc_x)), int(max(loc_x))]
+        y_lim = [int(min(loc_y)), int(max(loc_y))]
+
+        step = int(self.stride * level_downsamples[self.extract_layer])
+
+        for x in range(x_lim[0], x_lim[1], step):
+            for y in range(y_lim[0], y_lim[1], step):
                 x_idx = int(x / self.rescale_rate)
                 y_idx = int(y / self.rescale_rate)
                 x_idx_1 = int((x + self.patch_size * level_downsamples[self.extract_layer]) / self.rescale_rate)
                 y_idx_1 = int((y + self.patch_size * level_downsamples[self.extract_layer]) / self.rescale_rate)
+
                 if x_idx_1 >= wsi_thumb_mask.shape[1]:
                     x_idx_1 = x_idx
                 if y_idx_1 >= wsi_thumb_mask.shape[0]:
                     y_idx_1 = y_idx
+
                 if np.count_nonzero(wsi_thumb_mask[y_idx:y_idx_1, x_idx:x_idx_1]) > 0:
                     loc_x_selected.append(int(x))
                     loc_y_selected.append(int(y))
 
-        if self.randomize_order:
+        if self.randomize_order and len(loc_x_selected) > 0:
             index = np.arange(len(loc_x_selected))
             np.random.shuffle(index)
             loc_x_selected = [loc_x_selected[k] for k in index]
@@ -182,21 +235,22 @@ class PatchExtractor:
 
     def get_patch_locations_from_ROIs(self, ROIs, level_downsamples):
         """
-        Given a ROI list,  either return all the pixel positions that are in ROI
-        :param ROIs: ROIs [[min_x, min_y, max_x, max_y], ...]
-        :return: coordinate array where the positive pixels are
+        Given a ROI list, return patch coordinates inside ROIs
         """
         loc_x_selected = []
         loc_y_selected = []
+
+        step = int(self.stride * level_downsamples[self.extract_layer])
+
         for roi in ROIs:
             x_lim = [roi[0], roi[2]]
             y_lim = [roi[1], roi[3]]
-            for x in range(x_lim[0], x_lim[1], int(self.stride * level_downsamples[self.extract_layer])):
-                for y in range(y_lim[0], y_lim[1], int(self.stride * level_downsamples[self.extract_layer])):
+            for x in range(x_lim[0], x_lim[1], step):
+                for y in range(y_lim[0], y_lim[1], step):
                     loc_x_selected.append(int(x))
                     loc_y_selected.append(int(y))
 
-        if self.randomize_order:
+        if self.randomize_order and len(loc_x_selected) > 0:
             index = np.arange(len(loc_x_selected))
             np.random.shuffle(index)
             loc_x_selected = [loc_x_selected[k] for k in index]
@@ -206,215 +260,211 @@ class PatchExtractor:
 
     def validate_extract_locations(self, case_info, locations, thumbnail, level_downsamples):
         """
-        create a figure to validate the locations
-        :param locations:
-        :return:
+        Save a validation image with extracted patch grid overlaid
         """
         if self.log_dir is None:
             print("log dir is None, validation image will not be saved")
-        else:
-            if not os.path.exists(self.log_dir):
-                try:
-                    os.makedirs(self.log_dir, exist_ok=True)
-                except OSError:
-                    raise Exception("Can't create/access log_dir, unable to save validation image")
-            else:
-                draw = ImageDraw.Draw(thumbnail)
-                [loc_x_selected, loc_y_selected] = locations
-                thumb_fn = os.path.join(self.log_dir,
-                                        case_info["fn_str"] + "_extraction_grid_" + str(len(loc_x_selected)) + ".png")
-                if not os.path.exists(thumb_fn):
-                    for i in range(len(loc_x_selected)):
-                        xy = [int(loc_x_selected[i] / self.rescale_rate),
-                              int(loc_y_selected[i] / self.rescale_rate),
-                              int((loc_x_selected[i] + self.patch_size * level_downsamples[
-                                  self.extract_layer]) / self.rescale_rate),
-                              int((loc_y_selected[i] + self.patch_size * level_downsamples[
-                                  self.extract_layer]) / self.rescale_rate)]
-                        draw.rectangle(xy, outline='green')
-                    # thumbnail.show()
-                    print("Grids numbers in total: %d" % len(loc_x_selected))
-                    thumbnail.save(thumb_fn)
+            return
+
+        os.makedirs(self.log_dir, exist_ok=True)
+
+        loc_x_selected, loc_y_selected = locations
+        if len(loc_x_selected) == 0:
+            logger.warning("No patch locations found; skipping validation image.")
+            return
+
+        thumb_fn = os.path.join(
+            self.log_dir,
+            case_info["fn_str"] + "_extraction_grid_" + str(len(loc_x_selected)) + ".png",
+        )
+        if os.path.exists(thumb_fn):
+            return
+
+        thumb_copy = thumbnail.copy()
+        draw = ImageDraw.Draw(thumb_copy)
+
+        for i in range(len(loc_x_selected)):
+            xy = [
+                int(loc_x_selected[i] / self.rescale_rate),
+                int(loc_y_selected[i] / self.rescale_rate),
+                int((loc_x_selected[i] + self.patch_size * level_downsamples[self.extract_layer]) / self.rescale_rate),
+                int((loc_y_selected[i] + self.patch_size * level_downsamples[self.extract_layer]) / self.rescale_rate),
+            ]
+            draw.rectangle(xy, outline="green")
+
+        print("Grids numbers in total: %d" % len(loc_x_selected))
+        thumb_copy.save(thumb_fn)
 
     @staticmethod
     def filter_by_content_area(rgb_image_array, area_threshold=0.4, brightness=85):
         """
-        Takes an RGB image array as input,
-            converts into LAB space
-            checks whether the brightness value exceeds the threshold
-            returns a boolean indicating whether the amount of tissue > minimum required
-
-        :param rgb_image_array:
-        :param area_threshold:
-        :param brightness:
-        :return:
+        Return True if patch contains enough tissue
         """
-        # TODO: Alternative tissue detectors, not just RGB->LAB->Thresh
-        # rgb_image_array[np.any(rgb_image_array == [0, 0, 0], axis=-1)] = [255, 255, 255]
         lab_img = rgb2lab(rgb_image_array)
         l_img = lab_img[:, :, 0]
         binary_img_array_1 = np.array(0 < l_img)
         binary_img_array_2 = np.array(l_img < brightness)
         binary_img = np.logical_and(binary_img_array_1, binary_img_array_2) * 255
         tissue_size = np.where(binary_img > 0)[0].size
-        tissue_ratio = tissue_size * 3 / rgb_image_array.size  # 3 channels
-        if tissue_ratio > area_threshold:
-            return True
-        else:
-            return False
+        tissue_ratio = tissue_size * 3 / rgb_image_array.size
+        return tissue_ratio > area_threshold
 
     def get_patch_label(self, patch_loc, Center=True):
         """
-        :param patch_loc:  where the patch is extracted(top left)
-        :param Center:  use the top left (False) or the center of the patch (True) to get the annotation label
-        :return: label ID and label text
+        Get annotation label for a patch location
         """
+        if self.annotations is None:
+            return -1, "None"
+
         if Center:
             pix_loc = (patch_loc[0] + self.patch_size, patch_loc[1] + self.patch_size)
         else:
             pix_loc = patch_loc
+
         label_id, label_txt = self.annotations.get_pixel_label(pix_loc)
         return label_id, label_txt
 
     def generate_patch_fn(self, case_info, patch_loc, label_text=None):
-        """
-        Creates the filenames, if we save the patches as jpg/png files.
-
-        :param case_info: likely a UUID or sample name
-        :param patch_loc: tuple of (x, y) locations for where the patch came from
-        :param label_text: #TODO: Need to define this
-        :return: outputFileName
-        """
         if label_text is None:
-            tmp = (case_info["fn_str"] + "_%d_%d" + self.save_format) % (int(patch_loc[0]), int(patch_loc[1]))
+            filename = (
+                f"{case_info['fn_str']}_{int(patch_loc[0])}_{int(patch_loc[1])}{self.save_format}"
+            )
         else:
-            tmp = (case_info["fn_str"] + "_%d_%d_%s" + self.save_format) % (
-                int(patch_loc[0]), int(patch_loc[1]), label_text)
-        return os.path.join(self.save_dir, case_info["fn_str"], tmp)
+            filename = (
+                f"{case_info['fn_str']}_{int(patch_loc[0])}_{int(patch_loc[1])}_{label_text}{self.save_format}"
+            )
+
+        return os.path.join(self.save_dir, filename)
 
     def generate_tfRecords_fp(self, case_info):
         """
-        Generates the TFRecord filename and writer object
-        :param case_info: likely a UUID or sample name
-        :return: TFWriterObject, outputFileName
+        Create TFRecord writer. Only valid if TensorFlow is installed.
         """
+        if tf is None:
+            raise ImportError(
+                "TensorFlow is not installed. TFRecord output requires tensorflow, "
+                "but your current workflow can use .png, .jpg, or .h5 instead."
+            )
+
         tmp = case_info["fn_str"] + self.save_format
         fn = os.path.join(self.save_dir, tmp)
-        writer = tf.io.TFRecordWriter(fn)  # generate tfRecord file handle
+        writer = tf.io.TFRecordWriter(fn)
         return writer, fn
 
     def img_patch_generator(self, x, y, wsi_obj, case_info, tf_writer=None):
         """Return image patches if they have enough tissue"""
-        patch = wsi_obj.read_region((x, y),
-                                    self.extract_layer,
-                                    (self.patch_size, self.patch_size)
-                                    ).convert("RGB")
+        patch = wsi_obj.read_region(
+            (x, y),
+            self.extract_layer,
+            (self.patch_size, self.patch_size),
+        ).convert("RGB")
+
         if self.patch_rescale_to:
             patch = patch.resize([self.patch_rescale_to, self.patch_rescale_to])
 
-        # Only print out the patches that contain tissue in them (e.g. Content Rich)
-        Content_rich = True
-        if self.patch_filter_by_area:  # if we need to filter the image patch
-            Content_rich = self.filter_by_content_area(np.array(patch), area_threshold=self.patch_filter_by_area)
-        if Content_rich:
-            global patch_cnt
-            patch_cnt += 1
-            if self.with_anno:
-                label_id, label_txt = self.get_patch_label([x, y])
-            else:
-                label_txt = "None"
-                label_id = -1  # can't delete this line, it will be used if save patch into tfRecords
+        content_rich = True
+        if self.patch_filter_by_area:
+            content_rich = self.filter_by_content_area(np.array(patch), area_threshold=self.patch_filter_by_area)
 
-            if self.with_feature_map:  # Append data to tfRecord file
-                # TODO: maybe need to find another way to do this
-                values = []
-                for eval_str in self.feature_map.eval_str:
-                    values.append(eval(eval_str))
-                features = self.feature_map.update_feature_map_eval(values)
-                example = tf.train.Example(
-                    features=tf.train.Features(feature=features))  # Create an example protocol buffer
-                tf_writer.write(example.SerializeToString())  # Serialize to string and write on the file
-                sys.stdout.flush()
-            else:  # save patch to jpg, with label text and id in file name
-                fn = self.generate_patch_fn(case_info, (x, y), label_text=label_txt)
-                if os.path.exists(fn):
-                    logger.error('You already wrote this image file')
-                if self.save_format == ".jpg":
-                    patch.save(fn)
-                elif self.save_format == ".png":
-                    patch.convert("RGBA").save(fn)
-                else:
-                    raise Exception("Can't recognize save format")
-                sys.stdout.flush()
-        else:
+        if not content_rich:
             logger.debug("No content found in image patch x: {} y: {}".format(x, y))
+            return
+
+        global patch_cnt
+        patch_cnt += 1
+
+        if self.with_anno:
+            label_id, label_txt = self.get_patch_label([x, y])
+        else:
+            label_txt = "None"
+            label_id = -1
+
+        if self.with_feature_map:
+            if tf is None:
+                raise ImportError("TensorFlow is required for tfrecord output.")
+            values = []
+            for eval_str in self.feature_map.eval_str:
+                values.append(eval(eval_str))
+            features = self.feature_map.update_feature_map_eval(values)
+            example = tf.train.Example(features=tf.train.Features(feature=features))
+            tf_writer.write(example.SerializeToString())
+            sys.stdout.flush()
+        else:
+            fn = self.generate_patch_fn(case_info, (x, y), label_text=label_txt)
+            if os.path.exists(fn):
+                logger.error("You already wrote this image file")
+            if self.save_format == ".jpg":
+                patch.save(fn)
+            elif self.save_format == ".png":
+                patch.convert("RGBA").save(fn)
+            else:
+                raise Exception("Can't recognize save format")
+            sys.stdout.flush()
 
     def parallel_save_patches(self, wsi_obj, case_info, indices):
+        global patch_cnt
+        patch_cnt = 0
+
         if self.with_feature_map:
-            tf_writer, tf_fn = self.generate_tfRecords_fp(case_info)
+            tf_writer, _ = self.generate_tfRecords_fp(case_info)
         else:
             tf_writer = None
-        [loc_x, loc_y] = indices
+
+        loc_x, loc_y = indices
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = [executor.submit(self.img_patch_generator, loc_x[idx], loc_y[idx], wsi_obj, case_info, tf_writer)
-                       for idx, lx
-                       in enumerate(loc_x)]
+            futures = [
+                executor.submit(self.img_patch_generator, x, y, wsi_obj, case_info, tf_writer)
+                for x, y in zip(loc_x, loc_y)
+            ]
             for f in concurrent.futures.as_completed(futures):
                 try:
                     f.result()
                 except NameError:
-                    # logger.warning('Unable to find x_loc: {}'.format(loc_x))
                     pass
-        if self.with_feature_map:
-            tf_writer.close()
-        global patch_cnt
-        logger.info('Found {} image patches'.format(patch_cnt))
 
-    # get image patches and write to files
+        if self.with_feature_map and tf_writer is not None:
+            tf_writer.close()
+
+        logger.info("Found {} image patches".format(patch_cnt))
+
     def save_patch_without_annotation(self, wsi_obj, case_info, indices):
         """
-        Saves images in either JPEG, PNG, or TFRecord format and returns the nubmer of patches it saved
-
-        :param wsi_obj: OpenSlideObject
-        :param case_info: likely a UUID or sample name
-        :param indices: tuple of (x, y) locations for where the patch will come from
-        :param threads: how many threads to use
-        :return: Number of patches written
+        Save patches when annotations are not used
         """
+        patch_cnt = 0
 
-        patch_cnt = 0  # count how many patches extracted
         if self.with_feature_map:
-            tf_writer, tf_fn = self.generate_tfRecords_fp(case_info)
-        [loc_x, loc_y] = indices
-        for idx, lx in enumerate(loc_x):
-            patch = wsi_obj.read_region((loc_x[idx], loc_y[idx]),
-                                        self.extract_layer,
-                                        (self.patch_size, self.patch_size)
-                                        ).convert("RGB")
+            tf_writer, _ = self.generate_tfRecords_fp(case_info)
+        else:
+            tf_writer = None
 
-            # Only print out the patches that contain tissue in them (e.g. Content Rich)
-            Content_rich = True
-            if self.patch_filter_by_area:  # if we need to filter the image patch
-                Content_rich = self.filter_by_content_area(np.array(patch), area_threshold=self.patch_filter_by_area)
-            if Content_rich:
+        loc_x, loc_y = indices
+        for idx, _ in enumerate(loc_x):
+            patch = wsi_obj.read_region(
+                (loc_x[idx], loc_y[idx]),
+                self.extract_layer,
+                (self.patch_size, self.patch_size),
+            ).convert("RGB")
+
+            content_rich = True
+            if self.patch_filter_by_area:
+                content_rich = self.filter_by_content_area(np.array(patch), area_threshold=self.patch_filter_by_area)
+
+            if content_rich:
                 patch_cnt += 1
-                if self.with_feature_map:  # Append data to tfRecord file
-                    # TODO: maybe need to find another way to do this
+                if self.with_feature_map:
+                    if tf is None:
+                        raise ImportError("TensorFlow is required for tfrecord output.")
                     values = []
                     for eval_str in self.feature_map.eval_str:
                         values.append(eval(eval_str))
                     features = self.feature_map.update_feature_map_eval(values)
-                    example = tf.train.Example(
-                        features=tf.train.Features(feature=features))  # Create an example protocol buffer
-                    tf_writer.write(example.SerializeToString())  # Serialize to string and write on the file
-                    logger.info('\rWrote {} to tfRecords '.format(patch_cnt))
+                    example = tf.train.Example(features=tf.train.Features(feature=features))
+                    tf_writer.write(example.SerializeToString())
+                    logger.info("\rWrote {} to tfRecords ".format(patch_cnt))
                     sys.stdout.flush()
-                else:  # save patch to jpg, with label text and id in file name
-                    # if logger.DEBUG == logger.root.level:
-                    #     import matplotlib.pyplot as plt
-                    #     plt.figure(1)
-                    #     plt.imshow(patch)
-                    #     plt.show()
+                else:
                     fn = self.generate_patch_fn(case_info, (loc_x[idx], loc_y[idx]))
                     if self.save_format == ".jpg":
                         patch.save(fn)
@@ -422,274 +472,198 @@ class PatchExtractor:
                         patch.convert("RGBA").save(fn)
                     else:
                         raise Exception("Can't recognize save format")
-                    logger.info('\rWrote {} to image files '.format(patch_cnt))
+                    logger.info("\rWrote {} to image files ".format(patch_cnt))
                     sys.stdout.flush()
             else:
                 logger.debug("No content found in image patch x: {} y: {}".format(loc_x[idx], loc_y[idx]))
-        tf_writer.close()
+
+        if tf_writer is not None:
+            tf_writer.close()
+
         return patch_cnt
 
     def save_patches_h5file(self, wsi_obj, case_info, indices):
         """
-        Saves images (and their labels) in .h5 format and returns the number of patches it saved
-
-        :param wsi_obj: OpenSlideObject
-        :param case_info: likely a UUID or sample name
-        :param indices: tuple of (x, y) locations for where the patch will come from
-        :return: Number of patches written
+        Save patches to .h5 format
         """
-        patch_cnt = 0  # count how many patches extracted
+        patch_cnt = 0
+
         if self.save_format != ".h5":
             print("Wrong file format. Not saving to h5 file")
             return patch_cnt
+
+        loc_x, loc_y = indices
+        total_patch_num = len(loc_x)
+
+        tmp = case_info["fn_str"] + "_loc" + self.save_format
+        loc_fn = os.path.join(self.save_dir, tmp)
+        loc_hdf5_file_w = h5py.File(loc_fn, mode="w")
+        loc_hdf5_file_w.create_dataset(name="location", shape=[total_patch_num, 2], dtype=int, data=indices)
+        loc_hdf5_file_w.close()
+
+        tmp = case_info["fn_str"] + self.save_format
+        fn = os.path.join(self.save_dir, tmp)
+        hdf5_file_w = h5py.File(fn, mode="w")
+
+        if self.patch_rescale_to:
+            key_shape = [total_patch_num, 3, self.patch_rescale_to, self.patch_rescale_to]
         else:
-            [loc_x, loc_y] = indices
-            total_patch_num = len(loc_x)
-            tmp = case_info["fn_str"] + "_loc" + self.save_format
-            loc_fn = os.path.join(self.save_dir, tmp)
-            loc_hdf5_file_w = h5py.File(loc_fn, mode='w')
-            loc_hdf5_file_w.create_dataset(name='location', shape=[total_patch_num, 2], dtype=int, data=indices)
-            loc_hdf5_file_w.close()
+            key_shape = [total_patch_num, 3, self.patch_size, self.patch_size]
 
-            tmp = case_info["fn_str"] + self.save_format
-            fn = os.path.join(self.save_dir, tmp)
-            hdf5_file_w = h5py.File(fn, mode='w')
-            if self.patch_rescale_to:
-                key_shape = [total_patch_num, 3, self.patch_rescale_to, self.patch_rescale_to]
-            else:
-                key_shape = [total_patch_num, 3, self.patch_size, self.patch_size]
-            img_storage = hdf5_file_w.create_dataset(name='image', shape=key_shape, dtype=np.uint8,
-                                                     chunks=(1, 3, key_shape[2], key_shape[3]),
-                                                     compression='gzip')
+        img_storage = hdf5_file_w.create_dataset(
+            name="image",
+            shape=key_shape,
+            dtype=np.uint8,
+            chunks=(1, 3, key_shape[2], key_shape[3]),
+            compression="gzip",
+        )
 
+        for idx, _ in enumerate(loc_x):
+            patch = wsi_obj.read_region(
+                (loc_x[idx], loc_y[idx]),
+                self.extract_layer,
+                (self.patch_size, self.patch_size),
+            ).convert("RGB")
 
-
-            for idx, lx in enumerate(loc_x):
-                if is_cuda_gpu_available:
-                    cucim_patch = wsi_obj.read_region((loc_x[idx], loc_y[idx]),
-                                                      (self.patch_size, self.patch_size),
-                                                      self.extract_layer, num_workers=16)
-                    if self.patch_rescale_to:
-                        cucim_patch = cucim.skimage.transform.resize(cucim_patch, [self.patch_rescale_to, self.patch_rescale_to, 3], preserve_range=True)
-                    img_arr = cupy.asarray(cucim_patch).transpose(2, 0, 1).get()
-                else:
-
-                    patch = wsi_obj.read_region((loc_x[idx], loc_y[idx]),
-                                                self.extract_layer,
-                                                (self.patch_size, self.patch_size)
-                                                ).convert("RGB")
-                    if self.patch_rescale_to:
-                        patch = patch.resize([self.patch_rescale_to, self.patch_rescale_to])
-                    img_arr = np.array(patch)[:, :, 0:3].astype(np.uint8).transpose(2, 0, 1)
-
-                img_storage[idx] = img_arr
-                patch_cnt += 1
-                #  # Serialize to string and write on the file
-                logger.info('\rWrote {} to h5 file '.format(patch_cnt))
-                sys.stdout.flush()
-
-            hdf5_file_w.close()
-
-        return patch_cnt
-
-    # get image patches and write to files
-    def save_patches(self, wsi_obj, case_info, indices):
-        """
-        Saves images (and their labels) in either JPEG, PNG, or TFRecord format and returns the number of patches it saved
-
-        :param wsi_obj: OpenSlideObject
-        :param case_info: likely a UUID or sample name
-        :param indices: tuple of (x, y) locations for where the patch will come from
-        :return: Number of patches written
-        """
-        patch_cnt = 0  # count how many patches extracted
-        if self.with_feature_map:
-            tf_writer, tf_fn = self.generate_tfRecords_fp(case_info)
-        [loc_x, loc_y] = indices
-        for idx, lx in enumerate(loc_x):
-            patch = wsi_obj.read_region((loc_x[idx], loc_y[idx]),
-                                        self.extract_layer,
-                                        (self.patch_size, self.patch_size)
-                                        ).convert("RGB")
             if self.patch_rescale_to:
                 patch = patch.resize([self.patch_rescale_to, self.patch_rescale_to])
-            # Only print out the patches that contain tissue in them (e.g. Content Rich)
-            Content_rich = True
-            if self.patch_filter_by_area:  # if we need to filter the image patch
-                Content_rich = self.filter_by_content_area(np.array(patch), area_threshold=self.patch_filter_by_area)
-            if Content_rich:
+
+            img_arr = np.array(patch)[:, :, 0:3].astype(np.uint8).transpose(2, 0, 1)
+
+            img_storage[idx] = img_arr
+            patch_cnt += 1
+            logger.info("\rWrote {} to h5 file ".format(patch_cnt))
+            sys.stdout.flush()
+
+        hdf5_file_w.close()
+        return patch_cnt
+
+    def save_patches(self, wsi_obj, case_info, indices):
+        """
+        Save patches to jpg/png or tfrecord
+        """
+        patch_cnt = 0
+
+        if self.with_feature_map:
+            tf_writer, _ = self.generate_tfRecords_fp(case_info)
+        else:
+            tf_writer = None
+
+        loc_x, loc_y = indices
+        for idx, _ in enumerate(loc_x):
+            patch = wsi_obj.read_region(
+                (loc_x[idx], loc_y[idx]),
+                self.extract_layer,
+                (self.patch_size, self.patch_size),
+            ).convert("RGB")
+
+            if self.patch_rescale_to:
+                patch = patch.resize([self.patch_rescale_to, self.patch_rescale_to])
+
+            content_rich = True
+            if self.patch_filter_by_area:
+                content_rich = self.filter_by_content_area(np.array(patch), area_threshold=self.patch_filter_by_area)
+
+            if content_rich:
                 patch_cnt += 1
+
                 if self.with_anno:
                     label_id, label_txt = self.get_patch_label([loc_x[idx], loc_y[idx]])
                 else:
                     label_txt = "None"
-                    label_id = -1  # can't delete this line, it will be used if save patch into tfRecords
-                if self.with_feature_map:  # Append data to tfRecord file
-                    # TODO: maybe need to find another way to do this
+                    label_id = -1
+
+                if self.with_feature_map:
+                    if tf is None:
+                        raise ImportError("TensorFlow is required for tfrecord output.")
                     values = []
                     for eval_str in self.feature_map.eval_str:
                         values.append(eval(eval_str))
                     features = self.feature_map.update_feature_map_eval(values)
-                    example = tf.train.Example(
-                        features=tf.train.Features(feature=features))  # Create an example protocol buffer
-                    tf_writer.write(example.SerializeToString())  # Serialize to string and write on the file
-                    logger.info('\rWrote {} to tfRecords '.format(patch_cnt))
+                    example = tf.train.Example(features=tf.train.Features(feature=features))
+                    tf_writer.write(example.SerializeToString())
+                    logger.info("\rWrote {} to tfRecords ".format(patch_cnt))
                     sys.stdout.flush()
-                else:  # save patch to jpg, with label text and id in file name
-                    # if logger.DEBUG == logger.root.level:
-                    #     import matplotlib.pyplot as plt
-                    #     plt.figure(1)
-                    #     plt.imshow(patch)
-                    #     plt.show()
+                else:
                     fn = self.generate_patch_fn(case_info, (loc_x[idx], loc_y[idx]), label_text=label_txt)
                     if not os.path.exists(os.path.split(fn)[0]):
-                        os.makedirs(os.path.split(fn)[0])
+                        os.makedirs(os.path.split(fn)[0], exist_ok=True)
+
                     if self.save_format == ".jpg":
                         patch.save(fn)
                     elif self.save_format == ".png":
                         patch.convert("RGBA").save(fn)
                     else:
                         raise Exception("Can't recognize save format")
-                    logger.info('\rWrote {} to image files '.format(patch_cnt))
+
+                    logger.info("\rWrote {} to image files ".format(patch_cnt))
                     sys.stdout.flush()
+
                 if self.sample_cnt == patch_cnt:
-                    if self.with_feature_map:
+                    if tf_writer is not None:
                         tf_writer.close()
                     return patch_cnt
             else:
                 logger.debug("No content found in image patch x: {} y: {}".format(loc_x[idx], loc_y[idx]))
-        if self.with_feature_map:
+
+        if tf_writer is not None:
             tf_writer.close()
 
         return patch_cnt
 
     def extract(self, wsi_fn):
         """
-        Extract image patches from all the foreground(tissue)
-        :param wsi_fn: a single filename of a WSI
-        :return: Number of patches written
+        Extract image patches from foreground tissue
         """
         wsi_obj, case_info = self.get_case_info(wsi_fn)
         wsi_fn_short = os.path.split(wsi_fn)[1]
-        case_finished_fn = os.path.join(self.save_dir, '%s_case_finished.txt' % wsi_fn_short)
+        case_finished_fn = os.path.join(self.save_dir, "%s_case_finished.txt" % wsi_fn_short)
+
         if os.path.exists(case_finished_fn):
             print("Patch already extracted: %s" % wsi_fn_short)
+            patches_cnt = 0
             try:
-                fp = open(case_finished_fn, 'w')
-                line = fp.readlines()[0]
-                patches_cnt = int(line.split(":")[1].strip())
-            except:
+                with open(case_finished_fn, "r") as fp:
+                    line = fp.readline().strip()
+                    if ":" in line:
+                        patches_cnt = int(line.split(":")[1].strip())
+            except Exception:
                 patches_cnt = 0
+            return patches_cnt
 
-        else:
-            wsi_thumb = self.get_thumbnail(wsi_obj)  # get the thumbnail
-            wsi_thumb_mask = self.tissue_detector.predict(wsi_thumb)  # get the foreground thumbnail mask
-            if is_cuda_gpu_available:
-                level_downsamples = wsi_obj.resolutions['level_downsamples']
-            else:
-                level_downsamples = wsi_obj.level_downsamples
-            extract_locations = self.get_patch_locations(wsi_thumb_mask, level_downsamples)
-            self.validate_extract_locations(case_info, extract_locations, wsi_thumb, level_downsamples)
-            if self.save_format == '.h5':
-                patches_cnt = self.save_patches_h5file(wsi_obj, case_info, extract_locations)
-            else:
-                patches_cnt = self.save_patches(wsi_obj, case_info, extract_locations)
-            fp = open(case_finished_fn, 'w')
-            fp.write("Patch Num: %d " % patches_cnt)
-            fp.close()
-        return patches_cnt
+        wsi_thumb = self.get_thumbnail(wsi_obj)
+        wsi_thumb_mask = self.tissue_detector.predict(wsi_thumb)
 
-        # if logger.DEBUG == logger.root.level:
-        #     import matplotlib.pyplot as plt
-        #     fig, ax = plt.subplots(2, 1)
-        #     ax[0].imshow(wsi_thumb)
-        #     ax[1].imshow(wsi_thumb_mask, cmap='gray')
-        #     plt.show()
-        # if not self.with_anno:
-        #     return self.save_patch_without_annotation(wsi_obj, case_info, self.get_patch_locations(wsi_thumb_mask))
-        # else:
-        #     raise Exception("Saving patches with annotations is not supported yet.")
-
-    def extract_ROIs(self, wsi_fn, ROIs):
-        '''
-        extract patches from ROI list
-        :param wsi_fn: WSI file name
-        :param ROIs:   example: ROIs = [[35000, 35000, 43000, 43000], [12000, 19000, 25000, 30000]]
-        :return:
-        '''
-        wsi_obj, case_info = self.get_case_info(wsi_fn)
-        if is_cuda_gpu_available:
-            level_downsamples = wsi_obj.resolutions['level_downsamples']
+        if is_cuda_gpu_available and hasattr(wsi_obj, "resolutions"):
+            level_downsamples = wsi_obj.resolutions["level_downsamples"]
         else:
             level_downsamples = wsi_obj.level_downsamples
+
+        extract_locations = self.get_patch_locations(wsi_thumb_mask, level_downsamples)
+        self.validate_extract_locations(case_info, extract_locations, wsi_thumb, level_downsamples)
+
+        if self.save_format == ".h5":
+            patches_cnt = self.save_patches_h5file(wsi_obj, case_info, extract_locations)
+        else:
+            patches_cnt = self.save_patches(wsi_obj, case_info, extract_locations)
+
+        with open(case_finished_fn, "w") as fp:
+            fp.write("Patch Num: %d " % patches_cnt)
+
+        return patches_cnt
+
+    def extract_ROIs(self, wsi_fn, ROIs):
+        """
+        Extract patches from a list of ROIs
+        """
+        wsi_obj, case_info = self.get_case_info(wsi_fn)
+
+        if is_cuda_gpu_available and hasattr(wsi_obj, "resolutions"):
+            level_downsamples = wsi_obj.resolutions["level_downsamples"]
+        else:
+            level_downsamples = wsi_obj.level_downsamples
+
         extract_locations = self.get_patch_locations_from_ROIs(ROIs, level_downsamples)
-        wsi_thumb = self.get_thumbnail(wsi_obj)  # get the thumbnail for validation
+        wsi_thumb = self.get_thumbnail(wsi_obj)
         self.validate_extract_locations(case_info, extract_locations, wsi_thumb, level_downsamples)
         return self.save_patches(wsi_obj, case_info, extract_locations)
-
-
-if __name__ == "__main__":
-    from wsitools.tissue_detection.tissue_detector import TissueDetector  # import dependent packages
-    from wsitools.patch_extraction.feature_map_creator import FeatureMapCreator
-    from wsitools.wsi_annotation.region_annotation import AnnotationRegions
-
-    # wsi_fn = "/projects/shart/digital_pathology/data/PenMarking/WSIs/MELF/e39a8d60a56844d695e9579bce8f0335.tiff"  # WSI file name
-    # output_dir = "/projects/shart/digital_pathology/data/PenMarking/temp"
-    #
-    # tissue_detector = TissueDetector("LAB_Threshold", threshold=85)  #
-    # # fm = FeatureMapCreator("./feature_maps/basic_fm_PL_eval.csv")  # use this template to create feature map
-    # # xml_fn = "/projects/shart/digital_pathology/data/PenMarking/annotations/temp/e39a8d60a56844d695e9579bce8f0335.xml"
-    # class_label_id_csv = "/projects/shart/digital_pathology/data/PenMarking/annotations/temp/label_id.csv"
-    # annotations = AnnotationRegions(xml_fn, class_label_id_csv)
-    # parameters = ExtractorParameters(output_dir, save_format='.tfrecord', sample_cnt=-1)
-    # patch_extractor = PatchExtractor(tissue_detector, parameters=parameters, feature_map=fm,
-    #                                  annotations=annotations)
-    # patch_num = patch_extractor.extract(wsi_fn)
-
-    # wsi_fn = "\\\\mfad\\researchmn\\HCPR\\HCPR-GYNECOLOGICALTUMORMICROENVIRONMENT\\WSIs\\OCMC-016.svs"  # WSI file name
-    # output_dir = "H:\\OvarianCancer\\ImageData\\Patches\\OCMC-016"
-    # log_dir = "H:\\OvarianCancer\\ImageData\\Patches\\OCMC-016_log"
-    #
-
-    # wsi_fn = "/infodev1/non-phi-data/junjiang/OvaryCancer/WSIs/OCMC-016.svs"  # WSI file name
-    # output_dir = "/infodev1/non-phi-data/junjiang/OvaryCancer/Patches/h5_files"
-    # log_dir = "/infodev1/non-phi-data/junjiang/OvaryCancer/Patches/logs"
-
-    wsi_fn = "/lus/grand/projects/gpu_hack/mayopath/data/TCGA/b5b131de-299e-4ecd-a0e5-5223ad101929/TCGA-DJ-A3UZ-01Z-00-DX1.5F80B690-1CF1-49FF-93D0-8C0E9A532C2C.svs"
-    output_dir = "/lus/grand/projects/gpu_hack/mayopath/Jun/data/test"
-    log_dir = "/lus/grand/projects/gpu_hack/mayopath/Jun/data/test/log"
-
-    # wsi_fn_list_csv = "./wsi_list_40x.csv"
-    # fp = open(wsi_fn_list_csv, 'r')
-    #
-    # wsi_fn_list = []
-    # for idx, i in enumerate(fp.readlines()):
-    #     wsi_fn_list.append(i.strip())
-    #     if idx == 8:
-    #         break
-
-
-    tissue_detector = TissueDetector("LAB_Threshold", threshold=85)  #
-
-    parameters = ExtractorParameters(output_dir, log_dir=log_dir, patch_size=500, stride=500, extract_layer=0,
-                                     save_format='.h5', sample_cnt=-1)
-    # save_dir=None, log_dir="./", save_format=".tfrecord", sample_cnt=-1, patch_filter_by_area=None, \
-    #                  with_anno=True, threads=20, rescale_rate=128, patch_size=128, stride=128, patch_rescale_to=None,
-    #                  extract_layer=0
-    '''
-    For example:
-    Slide resolution is 40x, but we need 20X image patches (size 512*512)
-    WSI level downsamples = [1 , 4, 16, 32], so can't directly read from level 1 to match our requirements
-    In our package, we can call the function like below:
-    parameters = ExtractorParameters(output_dir, log_dir=log_dir, save_format='.jpg', patch_size=1024, stride=1024, sample_cnt=-1, extract_layer=0, patch_rescale_to=512)
-    '''
-    patch_extractor = PatchExtractor(tissue_detector, parameters=parameters)
-    patch_num = patch_extractor.extract(wsi_fn)
-
-    # for wsi_fn in wsi_fn_list:
-    #     patch_num = patch_extractor.extract(wsi_fn)
-    # #
-    # ROIs = [[35000, 35000, 43000, 43000], [12000, 19000, 25000, 30000]]  # coordinates are from level 0
-    # patch_extractor.extract_ROIs(wsi_fn, ROIs)
-
-    print("%d Patches have been save to %s" % (patch_num, output_dir))
