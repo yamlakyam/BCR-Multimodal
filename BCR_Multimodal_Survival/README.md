@@ -23,6 +23,8 @@ If your system already has PyTorch installed and working, keep that installation
 Download the pretrained model checkpoints from the GitHub Release:
 
 **https://github.com/Emory-Empathathetic-AI-for-Health-Inst/Multimodal-Multi-scale-Framework-for-Ethical-AI-Model-Development/releases/download/mri-core-checkpoints-v1.0/mri_foundation.pth**
+
+
 **https://github.com/Emory-Empathathetic-AI-for-Health-Inst/Multimodal-Multi-scale-Framework-for-Ethical-AI-Model-Development/releases/download/mri-core-checkpoints-v1.0/sam_vit_b_01ec64.pth**
 
 Place the downloaded checkpoint files in the following locations:
